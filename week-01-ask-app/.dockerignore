@@ -1,0 +1,4 @@
+# Keep these out of the Docker image.
+.venv/
+.env
+__pycache__/

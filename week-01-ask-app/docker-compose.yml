@@ -1,0 +1,20 @@
+services:
+  # FastAPI backend: talks to Claude.
+  backend:
+    build: .
+    command: uvicorn backend:app --host 0.0.0.0 --port 8000
+    env_file: .env # Passes ANTHROPIC_API_KEY in when the container starts
+    ports:
+      - "8000:8000"
+
+  # Streamlit frontend: the web page.
+  frontend:
+    build: .
+    command: streamlit run frontend.py --server.address 0.0.0.0 --server.port 8501
+    environment:
+      # Inside Docker, containers reach each other by service name.
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend

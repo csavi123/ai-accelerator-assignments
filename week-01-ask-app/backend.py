@@ -9,7 +9,7 @@ import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 # Load variables from the .env file (this is where ANTHROPIC_API_KEY lives).
 load_dotenv()
@@ -20,8 +20,9 @@ logger = logging.getLogger("ask-app")
 
 MODEL = "claude-haiku-5-5"
 MIN_WORDS = 5  # Shorter text isn't worth summarising
-INPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_INPUT_COST_PER_MILLION_USD", "1.0"))
-OUTPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_OUTPUT_COST_PER_MILLION_USD", "5.0"))
+INPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_INPUT_COST_PER_MILLION_USD", "0.10"))
+OUTPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_OUTPUT_COST_PER_MILLION_USD", "0.50"))
+ENABLE_GUARDRAIL_DEMO = os.environ.get("ENABLE_GUARDRAIL_DEMO", "").lower() == "true"
 
 # Create the Claude client. It reads ANTHROPIC_API_KEY from the environment.
 # - timeout: give up on a single request after 60 seconds.
@@ -38,6 +39,10 @@ class UnusableAnswerError(Exception):
     pass
 
 
+class InvalidModelOutputError(Exception):
+    pass
+
+
 def friendly_error(error):
     """Turn an exception into (HTTP status code, message for the user). Never 500."""
     # APITimeoutError must be checked before APIConnectionError (it's a subclass).
@@ -51,6 +56,8 @@ def friendly_error(error):
         return 400, "Claude couldn't process that input. Try shorter or different text."
     if isinstance(error, UnusableAnswerError):
         return 502, str(error)
+    if isinstance(error, InvalidModelOutputError):
+        return 502, "Claude returned malformed output. Validation blocked the response."
     # Anything else (bad API key, Claude outage, a bug in our code...).
     return 503, "Something went wrong on our side. Please try again later."
 
@@ -155,20 +162,36 @@ class Sentiment(BaseModel):
 
 def ask_for_structured(prompt, output_model, system=""):
     """Ask Claude and get back an instance of output_model (e.g. Summary)."""
+    if ENABLE_GUARDRAIL_DEMO and "force_bad" in prompt.lower():
+        return validate_model_output(output_model, {"unexpected": "malformed"})
+
     # messages.parse checks Claude's reply against our model for us.
-    response = client.messages.parse(
-        model=MODEL,
-        max_tokens=16000,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=output_model,
-    )
+    try:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=16000,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            output_format=output_model,
+        )
+    except ValidationError as error:
+        raise InvalidModelOutputError("Claude returned malformed structured output.") from error
     # parsed_output is empty if Claude refused or ran out of room.
     if response.parsed_output is None:
         raise UnusableAnswerError(
             f"Claude couldn't produce a result for this text (reason: {response.stop_reason})."
         )
-    return response.parsed_output
+    return validate_model_output(output_model, response.parsed_output)
+
+
+def validate_model_output(output_model, parsed_output):
+    """Re-validate model output before returning it to an API caller."""
+    if isinstance(parsed_output, output_model):
+        parsed_output = parsed_output.model_dump()
+    try:
+        return output_model.model_validate(parsed_output)
+    except ValidationError as error:
+        raise InvalidModelOutputError("Claude returned malformed structured output.") from error
 
 
 @app.post("/summarise", response_model=Summary)

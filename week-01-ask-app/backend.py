@@ -1,6 +1,8 @@
 # backend.py - a tiny FastAPI server that forwards questions to Claude.
 
+import json
 import logging
+import os
 from typing import List, Literal
 
 import anthropic
@@ -18,6 +20,8 @@ logger = logging.getLogger("ask-app")
 
 MODEL = "claude-haiku-5-5"
 MIN_WORDS = 5  # Shorter text isn't worth summarising
+INPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_INPUT_COST_PER_MILLION_USD", "1.0"))
+OUTPUT_COST_PER_MILLION_USD = float(os.environ.get("ANTHROPIC_OUTPUT_COST_PER_MILLION_USD", "5.0"))
 
 # Create the Claude client. It reads ANTHROPIC_API_KEY from the environment.
 # - timeout: give up on a single request after 60 seconds.
@@ -87,26 +91,43 @@ def ask(body: Question):
     if error:
         return error
 
-    # A generator that yields Claude's answer piece by piece as it is written.
+    # NDJSON lets the answer stream while still sending usage metadata at the end.
     def generate():
+        answer_parts = []
         try:
             with client.messages.stream(
                 model=MODEL,
                 max_tokens=16000,  # High limit so long answers don't get cut off
                 messages=[{"role": "user", "content": body.question}],
             ) as stream:
-                # text_stream gives us just the answer text, a few words at a time.
                 for text in stream.text_stream:
-                    yield text
+                    answer_parts.append(text)
+                    yield json.dumps({"type": "chunk", "text": text}, ensure_ascii=False) + "\n"
+
+                message = stream.get_final_message()
+                input_tokens = message.usage.input_tokens
+                output_tokens = message.usage.output_tokens
+                cost_usd = (
+                    input_tokens * INPUT_COST_PER_MILLION_USD
+                    + output_tokens * OUTPUT_COST_PER_MILLION_USD
+                ) / 1_000_000
+                yield json.dumps(
+                    {
+                        "type": "done",
+                        "answer": "".join(answer_parts),
+                        "model": message.model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "tokens_used": input_tokens + output_tokens,
+                        "cost_usd": round(cost_usd, 8),
+                    }
+                ) + "\n"
         except Exception as error:
-            # Once streaming starts we can't change the status code, so we log
-            # the error and send a friendly message as the last piece of text.
             logger.exception("Streaming /ask failed")
             _, message = friendly_error(error)
-            yield f"\n\n⚠️ {message}"
+            yield json.dumps({"type": "error", "message": message}, ensure_ascii=False) + "\n"
 
-    # StreamingResponse sends each piece to the client as soon as we have it.
-    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 # --- Structured output endpoints ---

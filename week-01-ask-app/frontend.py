@@ -1,5 +1,6 @@
 # frontend.py - a simple Streamlit page that talks to our FastAPI backend.
 
+import json
 import os
 
 import requests
@@ -32,12 +33,31 @@ def check(response):
         raise BackendError(message)
 
 
-def stream_answer(question):
-    # stream=True lets us read the answer while the backend is still sending it.
+def stream_answer(question, result):
+    completed = False
     with requests.post(f"{BACKEND_URL}/ask", json={"question": question}, stream=True, timeout=TIMEOUT) as response:
         check(response)
-        for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
-            yield chunk
+        response.encoding = "utf-8"
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise BackendError("The backend returned an invalid streaming response.") from error
+
+            if event.get("type") == "chunk":
+                yield event["text"]
+            elif event.get("type") == "done":
+                result.update(event)
+                completed = True
+            elif event.get("type") == "error":
+                raise BackendError(event["message"])
+            else:
+                raise BackendError("The backend returned an unexpected streaming response.")
+
+    if not completed:
+        raise BackendError("The backend ended the response before returning usage details.")
 
 
 def post_text(endpoint, text):
@@ -55,8 +75,16 @@ with ask_tab:
             st.warning("Please type a question first.")
         else:
             try:
-                # write_stream shows each chunk on the page as it arrives.
-                st.write_stream(stream_answer(question))
+                result = {}
+                st.write_stream(stream_answer(question, result))
+                st.caption(f"Model: {result['model']}")
+                usage_columns = st.columns(2)
+                usage_columns[0].metric("Tokens used", result["tokens_used"])
+                usage_columns[1].metric("Estimated cost", f"${result['cost_usd']:.6f}")
+                st.caption(
+                    f"Input: {result['input_tokens']} tokens · "
+                    f"Output: {result['output_tokens']} tokens"
+                )
             except BackendError as error:
                 st.error(str(error))
             except requests.Timeout:
